@@ -1,9 +1,11 @@
 //! Нейросети: поиск номеров на кадре (YOLOv9, open-image-models) и чтение
-//! символов (fast-plate-ocr). Обе модели в формате ONNX, запускаются через
-//! ONNX Runtime на процессоре.
+//! символов (fast-plate-ocr), плюс маленькая сеть углов номера (вариант 2
+//! выпрямления, обучена нами: eval/train_corners.py). Все модели в формате ONNX,
+//! запускаются через ONNX Runtime на процессоре.
 
 use crate::imgops::{self, Rgb};
 use crate::plate::{self, Reading};
+use crate::rectify::{self, Pt};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
@@ -18,6 +20,7 @@ fn e<E: std::fmt::Display>(ctx: &str) -> impl Fn(E) -> String + '_ {
 const DET_ONNX: &[u8] = include_bytes!("../models/detector.onnx");
 const OCR_ONNX: &[u8] = include_bytes!("../models/ocr.onnx");
 const OCR_YAML: &str = include_str!("../models/ocr.yaml");
+const CORNERS_ONNX: &[u8] = include_bytes!("../models/corners.onnx");
 
 /// Ищет onnxruntime рядом с программой. Полный путь важен: в System32 у Windows 10
 /// лежит своя старая onnxruntime.dll, и её подхватывать нельзя.
@@ -111,6 +114,8 @@ impl Detector {
         Ok(Detector { s, size, conf })
     }
 
+    /// ШАГ 2. Где на кадре номера: кадр вписывается в квадрат 640×640
+    /// (letterbox), сеть выдаёт рамки с уверенностью, слабые отбрасываем.
     pub fn detect(&mut self, img: &Rgb) -> Res<Vec<Det>> {
         let (data, r, dw, dh) = imgops::letterbox_chw(img, self.size);
         let n = self.size as i64;
@@ -152,6 +157,8 @@ pub struct Reader {
     w: u32,
     h: u32,
     gray: bool,
+    /// Какие виды номеров разрешены (--formats); пусто — все.
+    pub allowed: Vec<bool>,
 }
 
 fn yaml_val<'a>(y: &'a str, key: &str) -> Option<&'a str> {
@@ -187,10 +194,13 @@ impl Reader {
             w: num("img_width", 128) as u32,
             h: num("img_height", 64) as u32,
             gray: yaml_val(&yaml, "image_color_mode") == Some("grayscale"),
+            allowed: Vec::new(),
         })
     }
 
-    /// Читает пачку вырезанных номеров за один прогон.
+    /// ШАГ 4. Читает пачку вырезанных номеров за один прогон: каждая вырезка
+    /// сжимается до 128×64, сеть выдаёт для 10 позиций вероятности 37 знаков
+    /// (0–9, A–Z, «_» — пусто), а plate::decode_shaped собирает из них номер РФ.
     pub fn read(&mut self, crops: &[Rgb]) -> Res<Vec<Reading>> {
         if crops.is_empty() {
             return Ok(Vec::new());
@@ -226,7 +236,55 @@ impl Reader {
                 } else {
                     None
                 };
-                plate::decode_shaped(p, self.slots, &self.alphabet, self.pad, one_line)
+                plate::decode_shaped(p, self.slots, &self.alphabet, self.pad, one_line, &self.allowed)
+            })
+            .collect())
+    }
+}
+
+/// ШАГ 3б, вариант 2. Маленькая сеть углов номера: по серой области вокруг рамки
+/// детектора (192×64) сразу выдаёт 4 угла таблички — 8 чисел в долях области.
+/// Обучена на фото AUTO.RIA с размеченными углами (eval/train_corners.py), ≈0,7 млн
+/// параметров; все номера кадра — одной пачкой.
+pub struct CornerNet {
+    s: Session,
+}
+
+impl CornerNet {
+    pub fn new(over: Option<&Path>, threads: usize) -> Res<CornerNet> {
+        Ok(CornerNet { s: session(&model_bytes(over, CORNERS_ONNX)?, threads)? })
+    }
+
+    /// Углы табличек для всех рамок кадра одной пачкой. None — рамка не подходит
+    /// (мелкая, двухстрочная) или ответ сети не прошёл проверку rectify::sane.
+    pub fn find(&mut self, img: &Rgb, dets: &[Det]) -> Res<Vec<Option<[Pt; 4]>>> {
+        let regs: Vec<Option<(f32, f32, f32, f32)>> = dets.iter().map(rectify::net_region).collect();
+        let (w, h) = (rectify::NET_W, rectify::NET_H);
+        let mut data = Vec::new();
+        let mut n = 0i64;
+        for &(x, y, rw, rh) in regs.iter().flatten() {
+            let rect = [(x, y), (x + rw, y), (x + rw, y + rh), (x, y + rh)];
+            let crop = rectify::warp(img, &rect, w, h).ok_or("сеть углов: не удалось вырезать область")?;
+            data.extend(crop.pixels().map(|p| {
+                (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0
+            }));
+            n += 1;
+        }
+        if n == 0 {
+            return Ok(vec![None; dets.len()]);
+        }
+        let t = Tensor::from_array((vec![n, 1, h as i64, w as i64], data)).map_err(e("тензор"))?;
+        let out = self.s.run(ort::inputs![t]).map_err(e("сеть углов"))?;
+        let (_, v) = out[0].try_extract_tensor::<f32>().map_err(e("сеть углов"))?;
+        let mut it = v.chunks_exact(8);
+        Ok(regs
+            .iter()
+            .zip(dets)
+            .map(|(r, d)| {
+                let (x, y, rw, rh) = (*r)?;
+                let c = it.next()?;
+                let pts = [0, 1, 2, 3].map(|k| (x + c[2 * k] * rw, y + c[2 * k + 1] * rh));
+                rectify::sane(&pts, d).then_some(pts)
             })
             .collect())
     }

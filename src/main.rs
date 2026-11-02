@@ -1,15 +1,29 @@
 //! Номерок — распознавание автомобильных номеров РФ на фото, видео и с IP-камер.
 //! Работает офлайн: детектор номеров YOLOv9 + распознаватель символов (ONNX),
 //! проверка формата по ГОСТ Р 50577, трекинг и голосование по кадрам на видео.
+//!
+//! Порядок работы (номера шагов есть в комментариях по всему коду):
+//!   ШАГ 1. кадр: фото с диска (load_image) или кадр видео/камеры (video.rs)
+//!   ШАГ 2. поиск номеров на кадре — детектор (engine.rs, Detector::detect)
+//!   ШАГ 3. вырезка номера: обычная (imgops::crop) и выпрямленная по 4 углам
+//!          преобразованием перспективы (rectify.rs) — Ctx::read_all.
+//!          Углы ищем двумя способами: по яркости (вариант 1, rectify::find_corners)
+//!          и маленькой нейросетью (вариант 2, engine.rs, CornerNet)
+//!   ШАГ 4. чтение символов (engine.rs, Reader::read) и проверка формата РФ
+//!          (plate.rs, decode_shaped)
+//!   ШАГ 5. страховка: из всех прочтений берём лучшее (better)
+//!   ШАГ 6. только видео: один номер — одна машина, голосование по кадрам (track.rs)
+//!   ШАГ 7. запись результата (report.rs)
 
 mod engine;
 mod imgops;
 mod plate;
+mod rectify;
 mod report;
 mod track;
 mod video;
 
-use engine::{Det, Detector, Reader, Res};
+use engine::{CornerNet, Det, Detector, Reader, Res};
 use imgops::Rgb;
 use plate::Reading;
 use report::{Record, Report};
@@ -37,11 +51,19 @@ const HELP: &str = "\
   --find СПИСОК       искать номера: «А123ВС77,К777ОО» или файл .txt (по строке)
   --video             сохранить видео с рамками (annotated.mp4)
   --det-conf X        порог детектора номеров, 0–1 (0.3)
+  --rectify РЕЖИМ     выпрямление наклонённых номеров: auto — читать обычную
+                      и выпрямленные вырезки и брать лучшую (по умолчанию),
+                      off — выключить, on — всегда выпрямленную, если углы
+                      найдены; classic / net — только один способ поиска углов
+                      (по яркости / нейросетью) плюс обычная вырезка
+  --formats СПИСОК    какие номера ждать, через запятую: легковые, такси,
+                      прицепы, полиция, мото, транзит (по умолчанию все)
   --gap С             видео: через сколько секунд без номера машина «уехала» (1.5)
   --repeat С          не повторять тот же номер чаще, чем раз в С секунд (20)
   --threads N         потоков процессора (все)
   --det ФАЙЛ.onnx     своя модель поиска номеров
   --ocr ФАЙЛ.onnx     своя модель чтения + --ocr-config ФАЙЛ.yaml
+  --corners ФАЙЛ.onnx своя модель углов номера
   --no-open           не открывать отчёт в конце
 
 Результат: plates.csv (Excel), plates.jsonl, report.html, папки crops и frames.
@@ -61,7 +83,33 @@ struct Opts {
     det: Option<PathBuf>,
     ocr: Option<PathBuf>,
     ocr_cfg: Option<PathBuf>,
+    corners: Option<PathBuf>,
     open: bool,
+    rectify: Rectify,
+    formats: Option<Vec<bool>>,
+}
+
+/// Режим выпрямления номера (шаг 3).
+#[derive(Clone, Copy, PartialEq)]
+enum Rectify {
+    /// обычная + оба способа поиска углов, берём лучшее прочтение
+    Auto,
+    Off,
+    /// всегда выпрямленная (углы сети, если нет — по яркости)
+    On,
+    /// обычная + углы по яркости (как в 0.2)
+    Classic,
+    /// обычная + углы нейросетью
+    Net,
+}
+
+impl Rectify {
+    fn classic(self) -> bool {
+        matches!(self, Rectify::Auto | Rectify::On | Rectify::Classic)
+    }
+    fn net(self) -> bool {
+        matches!(self, Rectify::Auto | Rectify::On | Rectify::Net)
+    }
 }
 
 fn parse_args(args: &[String]) -> Res<Opts> {
@@ -79,7 +127,10 @@ fn parse_args(args: &[String]) -> Res<Opts> {
         det: None,
         ocr: None,
         ocr_cfg: None,
+        corners: None,
         open: true,
+        rectify: Rectify::Auto,
+        formats: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -96,9 +147,21 @@ fn parse_args(args: &[String]) -> Res<Opts> {
             "--threads" => o.threads = num(val(a)?, a)?.clamp(1.0, 64.0) as usize,
             "--video" => o.video = true,
             "--no-open" => o.open = false,
+            "--rectify" => {
+                o.rectify = match val(a)?.to_lowercase().as_str() {
+                    "auto" | "авто" => Rectify::Auto,
+                    "off" | "no" | "0" | "выкл" | "нет" => Rectify::Off,
+                    "on" | "yes" | "1" | "вкл" | "да" | "only" => Rectify::On,
+                    "classic" | "яркость" => Rectify::Classic,
+                    "net" | "сеть" => Rectify::Net,
+                    v => return Err(format!("--rectify: auto, off, on, classic или net, а не «{v}»")),
+                }
+            }
+            "--formats" => o.formats = Some(plate::parse_kinds(&val(a)?)?),
             "--det" => o.det = Some(val(a)?.into()),
             "--ocr" => o.ocr = Some(val(a)?.into()),
             "--ocr-config" => o.ocr_cfg = Some(val(a)?.into()),
+            "--corners" => o.corners = Some(val(a)?.into()),
             "--find" => {
                 let v = val(a)?;
                 let text = if Path::new(&v).is_file() {
@@ -121,9 +184,68 @@ fn parse_args(args: &[String]) -> Res<Opts> {
     Ok(o)
 }
 
+/// Какая вырезка дала прочтение (шаг 3).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Crop {
+    /// прямоугольник детектора (как в 0.1)
+    Plain,
+    /// выпрямленная по углам, найденным по яркости (вариант 1)
+    Classic,
+    /// выпрямленная по углам, найденным нейросетью (вариант 2)
+    Net,
+}
+
+impl Crop {
+    pub fn name(self) -> &'static str {
+        match self {
+            Crop::Plain => "обычная",
+            Crop::Classic => "выпрямленная",
+            Crop::Net => "выпрямленная сетью",
+        }
+    }
+}
+
+/// Одно прочтение одной вырезки.
+#[derive(Clone)]
+pub struct Variant {
+    pub kind: Crop,
+    pub read: Reading,
+    pub corners: Option<[rectify::Pt; 4]>,
+}
+
+/// Один номер на кадре после шагов 2–5.
+#[derive(Clone)]
+pub struct Seen {
+    /// Рамка детектора.
+    pub det: Det,
+    /// Выбранное прочтение.
+    pub read: Reading,
+    /// Вырезка, с которой оно сделано (её же сохраняем в crops).
+    pub crop: Rgb,
+    /// С какой вырезки выбранное прочтение.
+    pub kind: Crop,
+    /// 4 угла таблички: выбранной выпрямленной вырезки, а если выбрана
+    /// обычная — найденные сетью или по яркости (для рамки на картинке).
+    pub corners: Option<[rectify::Pt; 4]>,
+    /// Все прочтения этого номера (для сравнения в plates.jsonl).
+    pub variants: Vec<Variant>,
+}
+
+/// ШАГ 5. Лучше ли прочтение `new`, чем текущее `best`.
+/// Номер допустимого формата РФ лучше «не похожего на номер»; при равенстве
+/// побеждает большая уверенность (минимальная вероятность символа).
+fn better(best: &Reading, new: &Reading) -> bool {
+    match (best.format.is_some(), new.format.is_some()) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => new.conf > best.conf,
+    }
+}
+
 struct Ctx {
     det: Detector,
     ocr: Reader,
+    corner_net: Option<CornerNet>,
     o: Opts,
     rep: Report,
     exe_dir: PathBuf,
@@ -172,14 +294,81 @@ impl Ctx {
         })
     }
 
-    /// Вырезает номера с небольшим запасом и читает их одной пачкой.
-    fn read_all(&mut self, img: &Rgb, dets: &[Det]) -> Res<(Vec<Rgb>, Vec<Reading>)> {
-        let crops: Vec<Rgb> = dets
+    /// ШАГИ 3–5 для всех номеров кадра: вырезаем каждый номер до трёх раз
+    /// (обычная + выпрямленные по двум способам поиска углов), читаем все
+    /// вырезки одной пачкой и для каждого номера оставляем лучшее прочтение.
+    fn read_all(&mut self, img: &Rgb, dets: &[Det]) -> Res<Vec<Seen>> {
+        let mode = self.o.rectify;
+        // ШАГ 3а. Обычная вырезка: прямоугольник детектора с небольшим запасом
+        // (так работала версия 0.1).
+        let mut cands: Vec<Vec<(Crop, Option<[rectify::Pt; 4]>, Rgb)>> = dets
             .iter()
-            .map(|d| imgops::crop(img, d.x1, d.y1, d.x2, d.y2, 0.02, 0.06))
+            .map(|d| vec![(Crop::Plain, None, imgops::crop(img, d.x1, d.y1, d.x2, d.y2, 0.02, 0.06))])
             .collect();
-        let reads = self.ocr.read(&crops)?;
-        Ok((crops, reads))
+        // ШАГ 3б. Выпрямленные вырезки: ищем 4 угла таблички и приводим её
+        // к ровному прямоугольнику преобразованием перспективы (rectify::warp).
+        let mut add = |k: usize, kind: Crop, pts: [rectify::Pt; 4]| {
+            if let Some(crop) = rectify::warp(img, &pts, rectify::OUT_W, rectify::OUT_H) {
+                cands[k].push((kind, Some(pts), crop));
+            }
+        };
+        //   вариант 1 — углы по яркости (rectify.rs, find_corners)
+        if mode.classic() {
+            for (k, d) in dets.iter().enumerate() {
+                if let Some(c) = rectify::find_corners(img, d) {
+                    add(k, Crop::Classic, c.pts);
+                }
+            }
+        }
+        //   вариант 2 — углы нейросетью (engine.rs, CornerNet::find)
+        if mode.net() {
+            if let Some(net) = self.corner_net.as_mut() {
+                for (k, pts) in net.find(img, dets)?.into_iter().enumerate() {
+                    if let Some(p) = pts {
+                        add(k, Crop::Net, p);
+                    }
+                }
+            }
+        }
+        // ШАГ 4. Распознаватель читает все вырезки за один прогон (engine.rs, Reader::read).
+        let batch: Vec<Rgb> = cands.iter().flatten().map(|(_, _, c)| c.clone()).collect();
+        let mut reads = self.ocr.read(&batch)?.into_iter();
+        // ШАГ 5. Страховка: из всех прочтений номера берём лучшее (better).
+        let mut out = Vec::new();
+        for (d, cs) in dets.iter().zip(cands) {
+            let mut variants = Vec::new();
+            let mut crops = Vec::new();
+            for (kind, corners, crop) in cs {
+                let read = reads.next().ok_or("распознаватель вернул меньше ответов")?;
+                variants.push(Variant { kind, read, corners });
+                crops.push(crop);
+            }
+            let mut best = 0;
+            for (i, v) in variants.iter().enumerate().skip(1) {
+                let pick = if mode == Rectify::On {
+                    // всегда выпрямленная: сеть важнее яркости
+                    best == 0 || v.kind == Crop::Net
+                } else {
+                    better(&variants[best].read, &v.read)
+                };
+                if pick {
+                    best = i;
+                }
+            }
+            let corners = variants[best].corners.or_else(|| {
+                let of = |k: Crop| variants.iter().find(|v| v.kind == k).and_then(|v| v.corners);
+                of(Crop::Net).or_else(|| of(Crop::Classic))
+            });
+            out.push(Seen {
+                det: *d,
+                read: variants[best].read.clone(),
+                crop: crops.swap_remove(best),
+                kind: variants[best].kind,
+                corners,
+                variants,
+            });
+        }
+        Ok(out)
     }
 
     fn save_crop(&self, n: usize, plate: &str, crop: &Rgb) -> String {
@@ -195,10 +384,10 @@ impl Ctx {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn emit(&mut self, time: String, t: f64, latin: &str, display: &str, conf: f32, format: &str,
-            frames: usize, source: &str, crop: &Rgb, frame: Option<&Rgb>, raw: &str) {
+    fn emit(&mut self, time: String, latin: &str, display: &str, conf: f32, format: &str,
+            frames: usize, source: &str, seen: &Seen, frame: Option<&Rgb>) {
         let n = self.rep.records.len() + 1;
-        let crop_name = self.save_crop(n, display, crop);
+        let crop_name = self.save_crop(n, display, &seen.crop);
         let frame_name = match frame {
             Some(f) => {
                 let name = format!("frames/{n:05}.jpg");
@@ -219,7 +408,7 @@ impl Ctx {
         eprint!("\r{:70}\r", "");
         println!("{:>10}  {:<12} {:>3.0}%  кадров: {frames:<3} {source}{mark}",
             if time.len() > 12 { &time[11..] } else { &time }, display, conf * 100.0);
-        let _ = t;
+        let d = &seen.det;
         self.rep.add(Record {
             n,
             time,
@@ -233,11 +422,27 @@ impl Ctx {
             crop: crop_name,
             frame: frame_name,
             found,
-            raw: raw.to_string(),
+            raw: seen.read.raw.clone(),
+            bbox: [d.x1, d.y1, d.x2, d.y2].map(|v| v.round()),
+            corners: seen.corners.map(|c| c.map(|(x, y)| [(x * 10.0).round() / 10.0, (y * 10.0).round() / 10.0]).to_vec()).unwrap_or_default(),
+            crop_kind: seen.kind.name().to_string(),
+            variants: seen
+                .variants
+                .iter()
+                .map(|v| report::VariantRec {
+                    kind: v.kind.name().to_string(),
+                    plate: v.read.display(),
+                    plate_latin: v.read.latin.clone(),
+                    raw: v.read.raw.clone(),
+                    conf: (v.read.conf * 1000.0).round() / 1000.0,
+                    format_ok: v.read.format.is_some(),
+                    corners: v.corners.map(|c| c.map(|(x, y)| [(x * 10.0).round() / 10.0, (y * 10.0).round() / 10.0]).to_vec()).unwrap_or_default(),
+                })
+                .collect(),
         });
     }
 
-    fn annotate(&self, img: &mut Rgb, d: &Det, text: &str, conf: f32) {
+    fn annotate(&self, img: &mut Rgb, d: &Det, corners: Option<&[rectify::Pt; 4]>, text: &str, conf: f32) {
         let ok = conf >= self.o.sure;
         let color = if self.matches(&plate::normalize(text)) {
             [40, 200, 90]
@@ -248,6 +453,12 @@ impl Ctx {
         };
         let th = (img.width() / 640).clamp(2, 6);
         imgops::rect(img, d.x1, d.y1, d.x2, d.y2, color, th);
+        // найденные углы таблички — голубым
+        if let Some(p) = corners {
+            for i in 0..4 {
+                imgops::line(img, p[i], p[(i + 1) % 4], [0, 200, 255], (th / 2).max(1));
+            }
+        }
         let px = (img.width() as f32 / 45.0).clamp(14.0, 48.0);
         imgops::label(img, d.x1, d.y1 - th as f32, &format!("{text}  {:.0}%", conf * 100.0), px, color, [0, 0, 0]);
     }
@@ -255,6 +466,7 @@ impl Ctx {
     // ───────────── фото ─────────────
 
     fn photo(&mut self, p: &Path) -> Res<()> {
+        // ШАГ 1 — кадр, ШАГ 2 — где на нём номера
         let img = load_image(p)?;
         let dets = self.det.detect(&img)?;
         let src = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -262,14 +474,16 @@ impl Ctx {
             println!("{:>10}  номеров не найдено  {src}", "—");
             return Ok(());
         }
-        let (crops, reads) = self.read_all(&img, &dets)?;
+        let seen = self.read_all(&img, &dets)?;
         let mut ann = img.clone();
-        for (d, r) in dets.iter().zip(&reads) {
-            self.annotate(&mut ann, d, &r.display(), r.conf);
+        for s in &seen {
+            self.annotate(&mut ann, &s.det, s.corners.as_ref(), &s.read.display(), s.read.conf);
         }
-        for ((d, r), c) in dets.iter().zip(&reads).zip(&crops) {
-            let conf = if d.w() < 40.0 { r.conf * 0.5 } else { r.conf };
-            self.emit(String::new(), 0.0, &r.latin, &r.display(), conf, r.format_name(), 1, &src, c, Some(&ann), &r.raw);
+        for s in &seen {
+            let r = &s.read;
+            // мелкий номер (уже 40 точек) читается ненадёжно
+            let conf = if s.det.w() < 40.0 { r.conf * 0.5 } else { r.conf };
+            self.emit(String::new(), &r.latin, &r.display(), conf, r.format_name(), 1, &src, s, Some(&ann));
         }
         Ok(())
     }
@@ -323,21 +537,24 @@ impl Ctx {
             } else {
                 (fr.index - 1) as f64 / fps as f64
             };
+            // ШАГ 2 — номера на кадре, ШАГИ 3–5 — вырезать и прочитать
             let dets: Vec<Det> = self.det.detect(&img)?.into_iter().take(8).collect();
-            let (crops, reads) = self.read_all(&img, &dets)?;
+            let seen = self.read_all(&img, &dets)?;
+            // ШАГ 6 — связать с номерами прошлых кадров (одна машина — один трек)
+            let reads: Vec<Reading> = seen.iter().map(|s| s.read.clone()).collect();
             let ids = tracker.update(&dets, &reads, t);
             let mut ann = img;
             for (k, d) in dets.iter().enumerate() {
                 let tr = &tracker.tracks[ids[k]];
                 let v = tr.verdict();
                 let (text, conf) = v.map(|v| (v.display, v.conf)).unwrap_or_default();
-                self.annotate(&mut ann, d, &text, conf);
+                self.annotate(&mut ann, d, seen[k].corners.as_ref(), &text, conf);
             }
             // лучший снимок трека: самый уверенный и крупный номер
             for (k, &i) in ids.iter().enumerate() {
                 let w = tracker.tracks[i].obs.last().map(|o| o.weight).unwrap_or(0.0);
                 if tracker.tracks[i].best.as_ref().is_none_or(|b| w > b.0) {
-                    tracker.tracks[i].best = Some((w, crops[k].clone(), imgops::fit_width(&ann, 1280)));
+                    tracker.tracks[i].best = Some((w, seen[k].clone(), imgops::fit_width(&ann, 1280)));
                 }
             }
             if self.o.video {
@@ -411,7 +628,7 @@ impl Ctx {
         }
     }
 
-    fn emit_verdict(&mut self, stream: bool, t: f64, v: &track::Verdict, src: &str, crop: &Rgb, frame: &Rgb) {
+    fn emit_verdict(&mut self, stream: bool, t: f64, v: &track::Verdict, src: &str, crop: &Seen, frame: &Rgb) {
         if let Some(&last) = self.emitted.get(&v.latin) {
             if t - last < self.o.repeat && v.format.is_some() {
                 return;
@@ -420,7 +637,7 @@ impl Ctx {
         self.emitted.insert(v.latin.clone(), t);
         let time = if stream { now_str() } else { hms(t) };
         let fmt = v.format.map(|f| plate::FORMATS[f].name).unwrap_or("не РФ / не распознан формат");
-        self.emit(time, t, &v.latin, &v.display, v.conf, fmt, v.reads, src, crop, Some(frame), "");
+        self.emit(time, &v.latin, &v.display, v.conf, fmt, v.reads, src, crop, Some(frame));
     }
 }
 
@@ -501,14 +718,22 @@ fn run(o: Opts, exe_dir: PathBuf) -> Res<PathBuf> {
     let ocr_path = o.ocr.clone().or_else(|| Some(models.join("ocr.onnx")).filter(|p| p.is_file()));
     let ocr_cfg = o.ocr_cfg.clone().or_else(|| ocr_path.as_ref().map(|p| p.with_extension("yaml")));
     let det = Detector::new(det_path.as_deref(), o.threads, o.det_conf)?;
-    let ocr = match (&ocr_path, &ocr_cfg) {
+    let mut ocr = match (&ocr_path, &ocr_cfg) {
         (Some(m), Some(c)) => Reader::new(Some((m, c)), o.threads)?,
         _ => Reader::new(None, o.threads)?,
     };
+    ocr.allowed = o.formats.clone().unwrap_or_default();
     let dir = out_dir(&o, &input);
     let rep = Report::create(&dir, &input)?;
     println!("Номерок {} · результат: {}\n", env!("CARGO_PKG_VERSION"), dir.display());
-    let mut cx = Ctx { det, ocr, o, rep, exe_dir, emitted: HashMap::new() };
+    // вариант 2: сеть углов (своя модель — --corners или models\\corners.onnx)
+    let corner_net = if o.rectify.net() {
+        let p = o.corners.clone().or_else(|| Some(models.join("corners.onnx")).filter(|p| p.is_file()));
+        Some(CornerNet::new(p.as_deref(), o.threads)?)
+    } else {
+        None
+    };
+    let mut cx = Ctx { det, ocr, corner_net, o, rep, exe_dir, emitted: HashMap::new() };
     let t0 = Instant::now();
     let p = PathBuf::from(&input);
     if video::is_stream(&input) {

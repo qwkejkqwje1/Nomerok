@@ -1,5 +1,5 @@
-//! Номера РФ: форматы по ГОСТ Р 50577, коды регионов, декодирование выхода
-//! распознавателя с учётом формата и вывод кириллицей.
+//! ШАГ 4б. Номера РФ: форматы по ГОСТ Р 50577, коды регионов, декодирование
+//! выхода распознавателя с учётом формата и вывод кириллицей.
 //!
 //! Распознаватель выдаёт для каждой из N позиций вероятности всех символов
 //! алфавита (+ символ-заполнитель). Вместо «самый вероятный символ на каждой
@@ -10,30 +10,94 @@
 /// 12 букв, допустимых в номерах РФ (латинские двойники кириллицы).
 pub const LETTERS: &str = "ABEKMHOPCTYX";
 
-/// Шаблоны: L — буква, D — цифра; хвост из 2–3 цифр — код региона.
+/// Виды российских номеров (ГОСТ Р 50577-2018 «Знаки государственные
+/// регистрационные транспортных средств»). У разных видов транспорта разный
+/// порядок букв и цифр — это не прихоть программы, а так выдаёт ГИБДД:
+///
+/// | вид                                | пример       | шаблон       |
+/// |------------------------------------|--------------|--------------|
+/// | легковые, грузовые                 | А123ВС 77    | Б ЦЦЦ ББ рег |
+/// | такси (жёлтые), автобусы           | АВ123 77     | ББ ЦЦЦ рег   |
+/// | прицепы                            | АВ1234 77    | ББ ЦЦЦЦ рег  |
+/// | полиция (синие)                    | А1234 77     | Б ЦЦЦЦ рег   |
+/// | мотоциклы, военные, тракторы       | 1234 АВ 77   | ЦЦЦЦ ББ рег  |
+/// | транзитные                         | АВ123С 77    | ББ ЦЦЦ Б рег |
+///
+/// Б — буква, Ц — цифра, «рег» — код региона из 2 или 3 цифр в правой части
+/// таблички. Букв всего 12 — те, что пишутся одинаково кириллицей и латиницей:
+/// А В Е К М Н О Р С Т У Х.
+/// В коде шаблон записан строкой: L — место буквы, D — место цифры,
+/// например «LDDDLLDD» = А123ВС77.
+///
+/// Зачем это нужно: распознаватель иногда путает похожие знаки (О и 0, В и 8).
+/// Зная, где по шаблону должна стоять буква, а где цифра, такие ошибки
+/// исправляем (см. decode_shaped). Если нужны не все виды, лишние можно
+/// отключить параметром --formats — тогда ошибок вида «прочитал легковой номер
+/// как полицейский» станет ещё меньше.
 pub struct Format {
+    /// L — буква, D — цифра.
     pub pattern: &'static str,
+    /// Название для отчёта.
     pub name: &'static str,
+    /// Вид для параметра --formats.
+    pub kind: Kind,
     /// Сколько последних символов — код региона.
     pub region: usize,
-    /// Насколько формат редок (логарифм априорной вероятности): обычных
-    /// легковых номеров на дорогах подавляющее большинство.
+    /// Насколько вид редок (логарифм априорной вероятности): легковых номеров
+    /// на дорогах подавляющее большинство, поэтому при сомнении выигрывают они.
     pub prior: f32,
 }
 
-pub const FORMATS: &[Format] = &[
-    Format { pattern: "LDDDLLDD", name: "легковой", region: 2, prior: 0.0 },
-    Format { pattern: "LDDDLLDDD", name: "легковой", region: 3, prior: 0.0 },
-    Format { pattern: "LLDDDDD", name: "такси/автобус", region: 2, prior: -2.0 },
-    Format { pattern: "LLDDDDDD", name: "такси/прицеп", region: 3, prior: -2.0 },
-    Format { pattern: "LLDDDDDDD", name: "прицеп", region: 3, prior: -2.5 },
-    Format { pattern: "DDDDLLDD", name: "мото/военный", region: 2, prior: -2.5 },
-    Format { pattern: "DDDDLLDDD", name: "мото", region: 3, prior: -2.5 },
-    Format { pattern: "LDDDDDD", name: "полиция", region: 2, prior: -3.0 },
-    Format { pattern: "LDDDDDDD", name: "полиция", region: 3, prior: -3.0 },
-    Format { pattern: "LLDDDLDD", name: "транзит", region: 2, prior: -3.0 },
-    Format { pattern: "LLDDDLDDD", name: "транзит", region: 3, prior: -3.0 },
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kind {
+    Car,
+    Taxi,
+    Trailer,
+    Police,
+    Moto,
+    Transit,
+}
+
+/// Названия видов для --formats (можно по-русски или по-английски).
+pub const KINDS: &[(Kind, &[&str])] = &[
+    (Kind::Car, &["легковые", "легковой", "обычные", "car"]),
+    (Kind::Taxi, &["такси", "автобусы", "taxi", "bus"]),
+    (Kind::Trailer, &["прицепы", "прицеп", "trailer"]),
+    (Kind::Police, &["полиция", "police"]),
+    (Kind::Moto, &["мото", "мотоциклы", "военные", "moto"]),
+    (Kind::Transit, &["транзит", "транзитные", "transit"]),
 ];
+
+pub const FORMATS: &[Format] = &[
+    Format { pattern: "LDDDLLDD", name: "легковой", kind: Kind::Car, region: 2, prior: 0.0 },
+    Format { pattern: "LDDDLLDDD", name: "легковой", kind: Kind::Car, region: 3, prior: 0.0 },
+    Format { pattern: "LLDDDDD", name: "такси/автобус", kind: Kind::Taxi, region: 2, prior: -2.0 },
+    Format { pattern: "LLDDDDDD", name: "такси/автобус", kind: Kind::Taxi, region: 3, prior: -2.0 },
+    Format { pattern: "LLDDDDDD", name: "прицеп", kind: Kind::Trailer, region: 2, prior: -2.5 },
+    Format { pattern: "LLDDDDDDD", name: "прицеп", kind: Kind::Trailer, region: 3, prior: -2.5 },
+    Format { pattern: "DDDDLLDD", name: "мото/военный", kind: Kind::Moto, region: 2, prior: -2.5 },
+    Format { pattern: "DDDDLLDDD", name: "мото/военный", kind: Kind::Moto, region: 3, prior: -2.5 },
+    Format { pattern: "LDDDDDD", name: "полиция", kind: Kind::Police, region: 2, prior: -3.0 },
+    Format { pattern: "LDDDDDDD", name: "полиция", kind: Kind::Police, region: 3, prior: -3.0 },
+    Format { pattern: "LLDDDLDD", name: "транзит", kind: Kind::Transit, region: 2, prior: -3.0 },
+    Format { pattern: "LLDDDLDDD", name: "транзит", kind: Kind::Transit, region: 3, prior: -3.0 },
+];
+
+/// «легковые,такси» → какие строки FORMATS разрешены.
+pub fn parse_kinds(list: &str) -> Result<Vec<bool>, String> {
+    let mut on = vec![false; FORMATS.len()];
+    for w in list.split([',', ';', ' ']).map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty()) {
+        let kind = KINDS
+            .iter()
+            .find(|(_, names)| names.contains(&w.as_str()))
+            .map(|(k, _)| *k)
+            .ok_or(format!("--formats: неизвестный вид «{w}» (легковые, такси, прицепы, полиция, мото, транзит)"))?;
+        for (i, f) in FORMATS.iter().enumerate() {
+            on[i] |= f.kind == kind;
+        }
+    }
+    Ok(on)
+}
 
 /// Трёхзначные коды регионов (двузначные 01–99 считаются допустимыми все).
 const REGIONS3: &[u16] = &[
@@ -135,18 +199,20 @@ impl Reading {
 /// Декодирует выход распознавателя: `probs[slot * k + class]`.
 #[allow(dead_code)]
 pub fn decode(probs: &[f32], slots: usize, alphabet: &[char], pad: char) -> Reading {
-    decode_shaped(probs, slots, alphabet, pad, None)
+    decode_shaped(probs, slots, alphabet, pad, None, &[])
 }
 
 /// То же с учётом формы таблички: `one_line` — вытянутая однострочная
 /// (ширина/высота больше ~2,6), иначе почти квадратная двухстрочная
 /// (мотоциклы, некоторые прицепы). Форма меняет априорную частоту форматов.
+/// `allowed` — какие строки FORMATS разрешены (пусто — все).
 pub fn decode_shaped(
     probs: &[f32],
     slots: usize,
     alphabet: &[char],
     pad: char,
     one_line: Option<bool>,
+    allowed: &[bool],
 ) -> Reading {
     let k = alphabet.len();
     let idx = |c: char| alphabet.iter().position(|&a| a == c);
@@ -197,7 +263,7 @@ pub fn decode_shaped(
     let mut best: Option<(f32, usize, String, Vec<f32>, f32)> = None;
     for (fi, f) in FORMATS.iter().enumerate() {
         let n = f.pattern.len();
-        if n > slots {
+        if n > slots || allowed.get(fi) == Some(&false) {
             continue;
         }
         let two_line_fmt = f.pattern.starts_with("DDDD");
@@ -326,6 +392,17 @@ mod tests {
         let r = dec(&sure("WOB1234"));
         assert_eq!(r.format, None);
         assert_eq!(r.latin, "WOB1234");
+    }
+
+    #[test]
+    fn formats_filter() {
+        let a: Vec<char> = ALPHA.chars().collect();
+        // «АВ123 77» без такси в списке превращается в ближайший легковой или остаётся «не РФ»
+        let only_cars = parse_kinds("легковые").unwrap();
+        let r = decode_shaped(&fake(&sure("AB12377"), 10), 10, &a, '_', None, &only_cars);
+        assert_ne!(r.format_name(), "такси/автобус");
+        assert!(parse_kinds("такси, мото").unwrap().iter().filter(|&&x| x).count() == 4);
+        assert!(parse_kinds("самолёты").is_err());
     }
 
     #[test]

@@ -93,6 +93,17 @@ pub fn rect(img: &mut Rgb, x1: f32, y1: f32, x2: f32, y2: f32, color: [u8; 3], t
     }
 }
 
+/// Отрезок толщиной th (для 4 углов таблички на снимке).
+pub fn line(img: &mut Rgb, a: (f32, f32), b: (f32, f32), color: [u8; 3], th: u32) {
+    let n = ((b.0 - a.0).abs().max((b.1 - a.1).abs()).ceil() as usize).max(1);
+    let r = (th as i64 - 1) / 2;
+    for k in 0..=n {
+        let t = k as f32 / n as f32;
+        let (x, y) = ((a.0 + (b.0 - a.0) * t) as i64, (a.1 + (b.1 - a.1) * t) as i64);
+        fill(img, x - r, y - r, th as i64, th as i64, color);
+    }
+}
+
 fn fill(img: &mut Rgb, x: i64, y: i64, w: i64, h: i64, color: [u8; 3]) {
     for yy in y.max(0)..(y + h).min(img.height() as i64) {
         for xx in x.max(0)..(x + w).min(img.width() as i64) {

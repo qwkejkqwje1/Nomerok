@@ -1,6 +1,6 @@
 [package]
 name = "nomerok"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Распознавание автомобильных номеров РФ на фото, видео и с IP-камер (офлайн)"
 license = "MIT"

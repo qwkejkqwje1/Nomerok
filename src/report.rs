@@ -25,6 +25,30 @@ pub struct Record {
     /// Совпал со списком --find.
     pub found: bool,
     pub raw: String,
+    /// Рамка детектора: x1, y1, x2, y2.
+    pub bbox: [f32; 4],
+    /// Углы таблички (левый верх, правый верх, правый низ, левый низ), если найдены.
+    pub corners: Vec<[f32; 2]>,
+    /// С какой вырезки прочитан номер: «обычная» или «выпрямленная».
+    pub crop_kind: String,
+    /// Все прочтения этого номера: обычная вырезка и выпрямленные (для сравнения).
+    pub variants: Vec<VariantRec>,
+}
+
+/// Одно прочтение одной вырезки (поле variants в plates.jsonl).
+#[derive(Clone, Serialize)]
+pub struct VariantRec {
+    /// «обычная», «выпрямленная» (углы по яркости) или «выпрямленная сетью».
+    pub kind: String,
+    pub plate: String,
+    pub plate_latin: String,
+    /// Что сеть прочитала «как есть», без правил формата РФ.
+    pub raw: String,
+    pub conf: f32,
+    /// Подошёл ли номер под формат РФ.
+    pub format_ok: bool,
+    /// Углы, по которым выпрямляли (пусто у обычной вырезки).
+    pub corners: Vec<[f32; 2]>,
 }
 
 pub struct Report {
