@@ -1,0 +1,22 @@
+ДООБУЧЕНИЕ МОДЕЛИ ЧТЕНИЯ НОМЕРОВ (нужен Python 3.10+, лучше на Linux/WSL или с GPU)
+
+1. pip install "fast-plate-ocr[train]"
+2. Наберите снимки табличек со своей камеры. Удобно: прогоните записи через
+   nomerok, возьмите папку crops\ и поправьте ошибки. Нужен CSV:
+       image_path,plate_text
+       crops/001.jpg,A123BC77
+   Текст — ЛАТИНИЦЕЙ (А→A, В→B, Е→E, К→K, М→M, Н→H, О→O, Р→P, С→C, Т→T, У→Y, Х→X),
+   без пробелов. Добавьте к своим данным датасет AUTO.RIA (prep_autoria.py),
+   чтобы модель не «забыла» общий случай. Даже 500–2000 своих снимков сильно помогают.
+3. Обучение (с этой модели, ~7 мин/эпоха на 2 ядрах для 50 тыс. снимков):
+   fast-plate-ocr train --model-config-file cct_xs_v2_global_model_config.yaml ^
+     --plate-config-file plate_config.yaml --annotations train.csv ^
+     --val-annotations val.csv --augmentation-path aug_ru.yaml ^
+     --weights-path ocr_ru.keras --epochs 10 --batch-size 64 --lr 0.0005 ^
+     --output-dir train_out --early-stopping-patience 4
+4. Экспорт:  fast-plate-ocr export -m train_out\<дата>\best.keras ^
+     --plate-config-file plate_config.yaml --save-dir out
+5. Скопируйте out\best.onnx -> models\ocr.onnx и plate_config.yaml -> models\ocr.yaml
+   рядом с nomerok.exe.
+6. Проверка точности: python eval_test.py out\best.onnx (CSV с тестом — ds/ru_test.csv,
+   поправьте путь в скрипте).

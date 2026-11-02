@@ -1,0 +1,24 @@
+[package]
+name = "nomerok"
+version = "0.1.0"
+edition = "2021"
+description = "Распознавание автомобильных номеров РФ на фото, видео и с IP-камер (офлайн)"
+license = "MIT"
+
+[dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "std"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "webp"] }
+ab_glyph = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"

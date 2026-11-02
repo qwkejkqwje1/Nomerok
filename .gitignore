@@ -1,0 +1,7 @@
+*.exe
+*.dll
+*.keras
+*.onnx
+*.ttf
+*_nomerok/
+target/

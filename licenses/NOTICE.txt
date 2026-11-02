@@ -1,0 +1,11 @@
+Nomerok includes:
+- License plate detector: open-image-models (ankandrew), YOLOv9-t 640 end2end, MIT License.
+  https://github.com/ankandrew/open-image-models
+- Plate OCR: fast-plate-ocr (ankandrew), CCT-XS v2 global, MIT License,
+  fine-tuned on AUTO.RIA Numberplate OCR RU Dataset (CC BY 4.0, Habr.com community,
+  https://nomeroff.net.ua/datasets/). See AUTO.RIA-dataset-CC-BY-4.0.txt.
+  https://github.com/ankandrew/fast-plate-ocr
+- ONNX Runtime 1.22.0, MIT License, Microsoft. See onnxruntime-LICENSE.txt.
+- Microsoft Visual C++ runtime redistributable files (msvcp140*.dll, vcruntime140*.dll).
+- Liberation Sans Bold font, SIL Open Font License 1.1.
+- Rust crates: ort, image, ab_glyph, serde, serde_json, chrono, windows-sys (MIT/Apache-2.0).
